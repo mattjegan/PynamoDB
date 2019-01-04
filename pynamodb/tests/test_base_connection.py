@@ -4,10 +4,16 @@ Tests for the base connection class
 import base64
 import json
 import six
+
+import botocore.exceptions
+from botocore.awsrequest import AWSRequest, AWSResponse
+from botocore.client import ClientError
+from botocore.exceptions import BotoCoreError
+from botocore.vendored import requests
+
 from pynamodb.compat import CompatTestCase as TestCase
 from pynamodb.connection import Connection
 from pynamodb.connection.base import MetaTable
-from botocore.vendored import requests
 from pynamodb.exceptions import (VerboseClientError,
     TableError, DeleteError, UpdateError, PutError, GetError, ScanError, QueryError, TableDoesNotExist)
 from pynamodb.constants import (
@@ -15,8 +21,7 @@ from pynamodb.constants import (
 from pynamodb.expressions.operand import Path
 from pynamodb.tests.data import DESCRIBE_TABLE_DATA, GET_ITEM_DATA, LIST_TABLE_DATA
 from pynamodb.tests.deep_eq import deep_eq
-from botocore.exceptions import BotoCoreError
-from botocore.client import ClientError
+
 if six.PY3:
     from unittest.mock import patch
     from unittest import mock
@@ -75,8 +80,8 @@ class ConnectionTestCase(TestCase):
 
             session_mock.create_client.assert_has_calls(
                 [
-                    mock.call('dynamodb', 'us-east-1', endpoint_url=None),
-                    mock.call('dynamodb', 'us-east-1', endpoint_url=None),
+                    mock.call('dynamodb', 'us-east-1', endpoint_url=None, config=mock.ANY),
+                    mock.call('dynamodb', 'us-east-1', endpoint_url=None, config=mock.ANY),
                 ],
                 any_order=True
             )
@@ -91,7 +96,7 @@ class ConnectionTestCase(TestCase):
             self.assertIsNotNone(conn.client)
 
             self.assertEquals(
-                session_mock.create_client.mock_calls.count(mock.call('dynamodb', 'us-east-1', endpoint_url=None)),
+                session_mock.create_client.mock_calls.count(mock.call('dynamodb', 'us-east-1', endpoint_url=None, config=mock.ANY)),
                 1
             )
 
@@ -2407,16 +2412,16 @@ class ConnectionTestCase(TestCase):
 
         self.assertEqual(0, len(sleep_mock.call_args_list))
 
-    @mock.patch('pynamodb.connection.Connection.session')
-    @mock.patch('pynamodb.connection.Connection.requests_session')
-    def test_make_api_call_throws_verbose_error_after_backoff(self, requests_session_mock, session_mock):
-
-        # mock response
-        response = requests.Response()
-        response.status_code = 500
+    @mock.patch('pynamodb.connection.Connection.client')
+    def test_make_api_call_throws_verbose_error_after_backoff(self, client_mock):
+        response = AWSResponse(
+            url='http://lyft.com',
+            status_code=500,
+            raw='',  # todo: use stream, like `botocore.tests.RawResponse`?
+            headers={'x-amzn-RequestId': 'abcdef'},
+        )
         response._content = json.dumps({'message': 'There is a problem', '__type': 'InternalServerError'}).encode('utf-8')
-        response.headers['x-amzn-RequestId'] = 'abcdef'
-        requests_session_mock.send.return_value = response
+        client_mock._endpoint.http_session.send.return_value = response
 
         c = Connection()
 
@@ -2431,23 +2436,23 @@ class ConnectionTestCase(TestCase):
                 raise
 
     @mock.patch('random.randint')
-    @mock.patch('pynamodb.connection.Connection.session')
-    @mock.patch('pynamodb.connection.Connection.requests_session')
-    def test_make_api_call_throws_verbose_error_after_backoff_later_succeeds(self, requests_session_mock, session_mock, rand_int_mock):
-
+    @mock.patch('pynamodb.connection.Connection.client')
+    def test_make_api_call_throws_verbose_error_after_backoff_later_succeeds(self, client_mock, rand_int_mock):
         # mock response
-        bad_response = requests.Response()
+        bad_response = mock.Mock(spec=AWSResponse)
         bad_response.status_code = 500
-        bad_response._content = json.dumps({'message': 'There is a problem', '__type': 'InternalServerError'}).encode(
+        bad_response.headers = {'x-amzn-RequestId': 'abcdef'}
+        bad_response.content = json.dumps({'message': 'There is a problem', '__type': 'InternalServerError'}).encode(
             'utf-8')
-        bad_response.headers['x-amzn-RequestId'] = 'abcdef'
 
         good_response_content = {'TableDescription': {'TableName': 'table', 'TableStatus': 'Creating'}}
-        good_response = requests.Response()
+        good_response = mock.Mock(spec=AWSResponse)
         good_response.status_code = 200
-        good_response._content = json.dumps(good_response_content).encode('utf-8')
+        good_response.headers = {}
+        good_response.content = json.dumps(good_response_content).encode('utf-8')
 
-        requests_session_mock.send.side_effect = [
+        send_mock = client_mock._endpoint.http_session.send
+        send_mock.side_effect = [
             bad_response,
             bad_response,
             good_response,
@@ -2458,7 +2463,7 @@ class ConnectionTestCase(TestCase):
         c = Connection()
 
         self.assertEqual(good_response_content, c._make_api_call('CreateTable', {'TableName': 'MyTable'}))
-        self.assertEqual(len(requests_session_mock.send.mock_calls), 3)
+        self.assertEqual(len(send_mock.mock_calls), 3)
 
         assert rand_int_mock.call_args_list == [mock.call(0, 25), mock.call(0, 50)]
 
@@ -2496,83 +2501,96 @@ class ConnectionTestCase(TestCase):
         self.assertEqual(called_request_object.data, expected_request_object.data)
         self.assertEqual(called_request_object.headers, expected_request_object.headers)
 
-    @mock.patch('pynamodb.connection.Connection.session')
-    @mock.patch('pynamodb.connection.Connection.requests_session')
-    def test_make_api_call_retries_properly(self, requests_session_mock, session_mock):
-        # mock response
-        deserializable_response = requests.Response()
+    @mock.patch('pynamodb.connection.Connection.client')
+    def test_make_api_call_retries_properly(self, client_mock):
+        deserializable_response = AWSResponse(
+            url='',
+            status_code=200,
+            headers={},
+            raw='',
+        )
         deserializable_response._content = json.dumps({'hello': 'world'}).encode('utf-8')
-        deserializable_response.status_code = 200
-        bad_response = requests.Response()
+
+        bad_response = AWSResponse(
+            url='',
+            status_code=503,
+            headers={},
+            raw='',
+        )
         bad_response._content = 'not_json'.encode('utf-8')
-        bad_response.status_code = 503
 
-        prepared_request = requests.Request('GET', 'http://lyft.com').prepare()
+        prepared_request = AWSRequest('GET', 'http://lyft.com').prepare()
 
-        requests_session_mock.send.side_effect = [
+        send_mock = client_mock._endpoint.http_session.send
+        send_mock.side_effect = [
             bad_response,
-            requests.Timeout('problems!'),
+            botocore.exceptions.ReadTimeoutError(endpoint_url='http://lyft.com'),
             bad_response,
-            deserializable_response
+            deserializable_response,
         ]
         c = Connection()
         c._max_retry_attempts_exception = 3
-        c._create_prepared_request = mock.Mock()
-        c._create_prepared_request.return_value = prepared_request
+        c._create_urllib3_prepared_request = mock.Mock()
+        c._create_urllib3_prepared_request.return_value = prepared_request
 
         c._make_api_call('DescribeTable', {'TableName': 'MyTable'})
-        self.assertEqual(len(requests_session_mock.mock_calls), 4)
+        self.assertEqual(len(send_mock.mock_calls), 4)
 
-        for call in requests_session_mock.mock_calls:
-            self.assertEqual(call[:2], ('send', (prepared_request,)))
+        for call in send_mock.mock_calls:
+            self.assertEqual(call[1][0], prepared_request)
 
-    @mock.patch('pynamodb.connection.Connection.session')
-    @mock.patch('pynamodb.connection.Connection.requests_session')
-    def test_make_api_call_throws_when_retries_exhausted(self, requests_session_mock, session_mock):
-        prepared_request = requests.Request('GET', 'http://lyft.com').prepare()
+    # TODO: include requests test still?
 
-        requests_session_mock.send.side_effect = [
-            requests.ConnectionError('problems!'),
-            requests.ConnectionError('problems!'),
-            requests.ConnectionError('problems!'),
-            requests.Timeout('problems!'),
+    @mock.patch('pynamodb.connection.Connection.client')
+    def test_make_api_call_urllib3_throws_when_retries_exhausted(self, client_mock):
+        prepared_request = AWSRequest('GET', 'http://lyft.com').prepare()
+
+        send_mock = client_mock._endpoint.http_session.send
+        send_mock.side_effect = [
+            botocore.exceptions.ConnectionError(error="problems"),
+            botocore.exceptions.ConnectionError(error="problems"),
+            botocore.exceptions.ConnectionError(error="problems"),
+            botocore.exceptions.ReadTimeoutError(endpoint_url="http://lyft.com"),
         ]
         c = Connection()
         c._max_retry_attempts_exception = 3
-        c._create_prepared_request = mock.Mock()
-        c._create_prepared_request.return_value = prepared_request
+        c._create_urllib3_prepared_request = mock.Mock()
+        c._create_urllib3_prepared_request.return_value = prepared_request
 
-        with self.assertRaises(requests.Timeout):
+        with self.assertRaises(botocore.exceptions.ReadTimeoutError):
             c._make_api_call('DescribeTable', {'TableName': 'MyTable'})
 
-        self.assertEqual(len(requests_session_mock.mock_calls), 4)
-        assert requests_session_mock.send.call_args[1]['timeout'] == 60
-        for call in requests_session_mock.mock_calls:
-            self.assertEqual(call[:2], ('send', (prepared_request,)))
+        self.assertEqual(len(send_mock.mock_calls), 4)
+        #assert send_mock.call_args[1]['timeout'] == 60
+        for call in send_mock.mock_calls:
+            self.assertEqual(call[1][0], prepared_request)
 
     @mock.patch('random.randint')
-    @mock.patch('pynamodb.connection.Connection.session')
-    @mock.patch('pynamodb.connection.Connection.requests_session')
-    def test_make_api_call_throws_retry_disabled(self, requests_session_mock, session_mock, rand_int_mock):
-        prepared_request = requests.Request('GET', 'http://lyft.com').prepare()
+    @mock.patch('pynamodb.connection.Connection.client')
+    def test_make_api_call_throws_retry_disabled(self, client_mock, rand_int_mock):
+        prepared_request = AWSRequest('GET', 'http://lyft.com').prepare()
 
-        requests_session_mock.send.side_effect = [
-            requests.Timeout('problems!'),
+        send_mock = client_mock._endpoint.http_session.send
+        send_mock.side_effect = [
+            botocore.exceptions.ReadTimeoutError(endpoint_url='http://lyft.com'),
         ]
         c = Connection(request_timeout_seconds=11, base_backoff_ms=3, max_retry_attempts=0)
-        c._create_prepared_request = mock.Mock()
-        c._create_prepared_request.return_value = prepared_request
+        c._create_urllib3_prepared_request = mock.Mock()
+        c._create_urllib3_prepared_request.return_value = prepared_request
 
+        # TODO: base backoff ms is not applicable when using botocore's http
+        # session directly. we should deprecate these in favor of similar config
+        # similar to botocore's exponential backoff
         assert c._base_backoff_ms == 3
-        with self.assertRaises(requests.Timeout):
+        with self.assertRaises(botocore.exceptions.ReadTimeoutError):
             c._make_api_call('DescribeTable', {'TableName': 'MyTable'})
 
-        self.assertEqual(len(requests_session_mock.mock_calls), 1)
+        self.assertEqual(len(send_mock.mock_calls), 1)
         rand_int_mock.assert_not_called()
 
-        assert requests_session_mock.send.call_args[1]['timeout'] == 11
-        for call in requests_session_mock.mock_calls:
-            self.assertEqual(call[:2], ('send', (prepared_request,)))
+        # assert send_mock.call_args[1]['timeout'] == 11
+        for call in send_mock.mock_calls:
+            self.assertEqual(call[1][0], prepared_request)
 
     def test_handle_binary_attributes_for_unprocessed_items(self):
         binary_blob = six.b('\x00\xFF\x00\xFF')

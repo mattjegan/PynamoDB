@@ -1,6 +1,9 @@
 from typing import Any, Dict, Iterator, Optional, Sequence, Text
 
+from botocore.awsrequest import AWSRequest
+
 from pynamodb.expressions.condition import Condition
+
 
 BOTOCORE_EXCEPTIONS: Any
 log: Any
@@ -128,3 +131,5 @@ class Connection:
     ) -> Dict: ...
 
     def query(self, table_name: Text, hash_key, attributes_to_get: Optional[Any] = ..., consistent_read: bool = ..., exclusive_start_key: Optional[Any] = ..., index_name: Optional[Any] = ..., key_conditions: Optional[Any] = ..., query_filters: Optional[Any] = ..., conditional_operator: Optional[Any] = ..., limit: Optional[Any] = ..., return_consumed_capacity: Optional[Any] = ..., scan_index_forward: Optional[Any] = ..., select: Optional[Any] = ...): ...
+
+    def _create_urllib3_prepared_request(self, params: Dict, operation_model: Optional[Any] = ...) -> AWSPreparedRequest: ...

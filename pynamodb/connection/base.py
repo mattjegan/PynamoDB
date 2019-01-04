@@ -3,6 +3,7 @@ Lowest level connection
 """
 from __future__ import division
 
+import json
 import logging
 import math
 import random
@@ -13,6 +14,8 @@ from base64 import b64decode
 from threading import local
 
 import six
+import botocore.client
+import botocore.exceptions
 from botocore.client import ClientError
 from botocore.exceptions import BotoCoreError
 from botocore.session import get_session
@@ -276,6 +279,9 @@ class Connection(object):
         log.error("%s failed with status: %s, message: %s",
                   operation, response.status_code,response.content)
 
+    def _create_urllib3_prepared_request(self, params, operation_model):
+        return self.client._endpoint.create_request(params, operation_model)
+
     def _create_prepared_request(self, request_dict, operation_model):
         """
         Create a prepared request object from request_dict, and operation_model
@@ -338,12 +344,24 @@ class Connection(object):
         1. It's faster to avoid using botocore's response parsing
         2. It provides a place to monkey patch requests for unit testing
         """
+
+        """
+        Garrett TODO:
+         * why was botocore's response parsing slow? is that still the case?
+           seems botocore does a lot. see "JSONParser" and that whole section.
+           it's unfortunate that we miss out on the retry and other things that they have built.
+        """
+
         operation_model = self.client._service_model.operation_model(operation_name)
         request_dict = self.client._convert_to_request_dict(
             operation_kwargs,
             operation_model
         )
-        prepared_request = self._create_prepared_request(request_dict, operation_model)
+
+        # TODO: add an option for switching between urllib3/requests? will need
+        # to document changes. especially things like exceptions
+        """prepared_request = self._create_prepared_request(request_dict, operation_model)"""
+        prepared_urllib3_request = self._create_urllib3_prepared_request(request_dict, operation_model)
 
         for i in range(0, self._max_retry_attempts_exception + 1):
             attempt_number = i + 1
@@ -356,13 +374,29 @@ class Connection(object):
                 if proxies is None:
                     proxies = self.client._endpoint.http_session._proxy_config._proxies
 
-                response = self.requests_session.send(
+                """
+                requests_response = self.requests_session.send(
                     prepared_request,
                     timeout=self._request_timeout_seconds,
                     proxies=proxies,
                 )
-                data = response.json()
-            except (requests.RequestException, ValueError) as e:
+                """
+
+                if i > 0:
+                    # If there is a stream associated with the request, we need
+                    # to reset it before attempting to send the request again.
+                    # This will ensure that we resend the entire contents of the
+                    # body.
+                    prepared_urllib3_request.reset_stream()
+
+                    # Create a new request when retried (including a new signature).
+                    prepared_urllib3_request = self._create_urllib3_prepared_request(request_dict, operation_model)
+
+                urllib3_response = self.client._endpoint.http_session.send(prepared_urllib3_request)  # type: botocore.awsrequest.AWSResponse
+
+                # data = response.json()
+                data = json.loads(urllib3_response.content)
+            except (requests.RequestException, ValueError, botocore.exceptions.HTTPClientError, botocore.exceptions.ConnectionError) as e:
                 if is_last_attempt_for_exceptions:
                     log.debug('Reached the maximum number of retry attempts: %s', attempt_number)
                     if response:
@@ -379,14 +413,16 @@ class Connection(object):
                     )
                     continue
 
-            if response.status_code >= 300:
+            status_code = response.status_code if response is not None else urllib3_response.status_code
+            headers = response.headers if response is not None else urllib3_response.headers
+            if status_code >= 300:
                 # Extract error code from __type
                 code = data.get('__type', '')
                 if '#' in code:
                     code = code.rsplit('#', 1)[1]
                 botocore_expected_format = {'Error': {'Message': data.get('message', ''), 'Code': code}}
                 verbose_properties = {
-                    'request_id': response.headers.get('x-amzn-RequestId')
+                    'request_id': headers.get('x-amzn-RequestId')
                 }
 
                 if 'RequestItems' in operation_kwargs:
@@ -401,7 +437,7 @@ class Connection(object):
                     if is_last_attempt_for_exceptions:
                         log.debug('Reached the maximum number of retry attempts: %s', attempt_number)
                         raise
-                    elif response.status_code < 500 and code != 'ProvisionedThroughputExceededException':
+                    elif status_code < 500 and code != 'ProvisionedThroughputExceededException':
                         # We don't retry on a ConditionalCheckFailedException or other 4xx (except for
                         # throughput related errors) because we assume they will fail in perpetuity.
                         # Retrying when there is already contention could cause other problems
@@ -489,7 +525,22 @@ class Connection(object):
         # if the client does not have credentials, we create a new client
         # otherwise the client is permanently poisoned in the case of metadata service flakiness when using IAM roles
         if not self._client or (self._client._request_signer and not self._client._request_signer._credentials):
-            self._client = self.session.create_client(SERVICE_NAME, self.region, endpoint_url=self.host)
+            # TODO(garrett): should we set the timeout directly on the
+            # httpsession instead? this represents a change to existing
+            # behavior, where we set `timeout` on the requests session which
+            # would have been an _overall_ timeout of 60 seconds. this would
+            # change behavior to be 60 seconds each for connect and read. there
+            # is no "total" option available in botocore config
+
+            # note that `max_pool_connections` defaults to 10 and can be
+            # configured using the config object below.
+            # TODO: check what the requests default is and possibly expose this
+            # as a top-level option via the API. note that this would invalidate
+            # the existing `session_cls` variable. if we really need this option
+            # still then we could allow subclassing
+            # `botocore.httpsession.URLLib3Session` instead
+            config = botocore.client.Config(connect_timeout=self._request_timeout_seconds, read_timeout=self._request_timeout_seconds)
+            self._client = self.session.create_client(SERVICE_NAME, self.region, endpoint_url=self.host, config=config)
         return self._client
 
     def get_meta_table(self, table_name, refresh=False):

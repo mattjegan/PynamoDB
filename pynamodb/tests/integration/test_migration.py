@@ -207,7 +207,7 @@ def test_legacy_boolean_attribute_deserialization_in_update_item(ddb_url, flag_v
     assert flag_value == LBAModel.get('pkey').flag
 
 
-@pytest.mark.parametrize("flag_value",[True, False, None])
+@pytest.mark.parametrize("flag_value", [True, False, None])
 @pytest.mark.ddblocal
 def test_boolean_attribute_deserialization_in_update(ddb_url, flag_value):
     class BAModel(Model):
